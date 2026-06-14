@@ -108,8 +108,9 @@ Coordenadas em porcentagem (0-100) relativas à imagem. Se não houver marca, ha
         })
       });
 
-      if (!res.ok) throw new Error(`API erro ${res.status}`);
-      const data = await res.json();
+      const data = await res.json().catch(()=>({}));
+      if (!res.ok) throw new Error(data.error?.message || data.error || `API erro ${res.status}`);
+      if (!Array.isArray(data.content)) throw new Error('Resposta inesperada da IA');
       const raw = data.content.map(c=>c.text||'').join('').replace(/```json|```/g,'').trim();
       let result;
       try { result = JSON.parse(raw); } catch(e) { throw new Error('Resposta inválida da IA'); }
