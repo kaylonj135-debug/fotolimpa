@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FotoLimpa — Fotos limpas, sem rastro</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d0f14; color: #e8eaf2; font-family: system-ui, -apple-system, sans-serif; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    input[type=range] { -webkit-appearance:none; width:100%; height:4px; background:#2a2f40; border-radius:2px; outline:none; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:20px; height:20px; border-radius:50%; background:#4fffb0; cursor:pointer; }
+    button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #161921; }
+    ::-webkit-scrollbar-thumb { background: #2a2f40; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useCallback } = React;
+
+    // ─── EXIF extractor ───────────────────────────────────────────────────────
+    async function extractExifTags(file) {
+      const tags = [];
+      try {
+        const buf = await file.arrayBuffer();
+        const view = new DataView(buf);
+        if (view.getUint16(0) !== 0xFFD8) return tags;
+        let off = 2;
+        while (off < Math.min(view.byteLength - 2, 131072)) {
+          const marker = view.getUint16(off);
+          if (marker === 0xFFDA) break;
+          if ((marker & 0xFF00) !== 0xFF00) { off++; continue; }
+          const segLen = view.getUint16(off + 2);
+          if (marker === 0xFFE1) {
+            const hdr = new TextDecoder('latin1').decode(new Uint8Array(buf, off+4, 6));
+            if (hdr.startsWith('Exif')) {
+              tags.push('GPS/Localização','Câmera','Data/Hora','ISO/Exposição');
+              const slice = new TextDecoder('latin1').decode(new Uint8Array(buf,off+10,Math.min(segLen,2048)));
+              if (slice.includes('GPS')) tags.push('Coord. GPS');
+              if (slice.includes('Software')) tags.push('Software');
+              if (slice.includes('Artist')||slice.includes('author')) tags.push('Autor');
+              if (slice.includes('Copyright')) tags.push('Copyright');
+            } else tags.push('XMP/Adobe');
+          }
+          if (marker === 0xFFE2) tags.push('ICC Profile');
+          if (marker === 0xFFEC) tags.push('IPTC');
+          if (segLen < 2) break;
+          off += 2 + segLen;
+        }
+      } catch(e) {}
+      return [...new Set(tags)];
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+    function loadImg(file) {
+      return new Promise((res,rej) => {
+        const img = new Image();
+        img.onload = () => res(img);
+        img.onerror = () => rej(new Error('Falha ao carregar imagem'));
+        img.src = URL.createObjectURL(file);
+      });
+    }
+
+    function toBlob(canvas, type='image/jpeg', q=0.92) {
+      return new Promise((res,rej) => canvas.toBlob(b => b?res(b):rej(new Error('Export falhou')),type,q));
+    }
+
+    function dlBlob(blob, name) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name; a.click();
+      setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    }
+
+    // ─── AI watermark removal ─────────────────────────────────────────────────
+    async function aiWatermarkRemove(canvas, onLog) {
+      const MAX = 900;
+      const scale = Math.min(1, MAX / Math.max(canvas.width, canvas.height));
+      const w = Math.round(canvas.width*scale), h = Math.round(canvas.height*scale);
+      const thumb = document.createElement('canvas');
+      thumb.width = w; thumb.height = h;
+      thumb.getContext('2d').drawImage(canvas,0,0,w,h);
+      const b64 = thumb.toDataURL('image/jpeg',0.82).split(',')[1];
+
+      onLog('Claude analisando a imagem…','active');
+
+      const res = await fetch('/.netlify/functions/claude', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          model:'claude-sonnet-4-6',
+          max_tokens:800,
+          system:`Você é especialista em detectar marcas d'água. Analise a imagem e responda APENAS com JSON válido, sem markdown:
+{"has_watermark":boolean,"regions":[{"x":number,"y":number,"w":number,"h":number}],"fill_color":"#hex","description":"string"}
+Coordenadas em porcentagem (0-100) relativas à imagem. Se não houver marca, has_watermark:false e regions:[].`,
+          messages:[{role:'user',content:[
+            {type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64}},
+            {type:'text',text:"Detecte marcas d'água e retorne o JSON."}
+          ]}]
+        })
+      });
+
+      if (!res.ok) throw new Error(`API erro ${res.status}`);
+      const data = await res.json();
+      const raw = data.content.map(c=>c.text||'').join('').replace(/```json|```/g,'').trim();
+      let result;
+      try { result = JSON.parse(raw); } catch(e) { throw new Error('Resposta inválida da IA'); }
+
+      if (!result.has_watermark || !result.regions?.length) {
+        onLog("Nenhuma marca d'água detectada pela IA",'done');
+        return;
+      }
+
+      onLog(`IA encontrou ${result.regions.length} região(ões) — reconstruindo…`,'done');
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+
+      result.regions.forEach(r => {
+        const rx=Math.round(r.x/100*W), ry=Math.round(r.y/100*H);
+        const rw=Math.max(1,Math.round(r.w/100*W)), rh=Math.max(1,Math.round(r.h/100*H));
+        const srcX = rx+rw+8 < W ? rx+rw+8 : Math.max(0,rx-rw-8);
+        ctx.drawImage(canvas,srcX,ry,rw,rh,rx,ry,rw,rh);
+        if (result.fill_color) {
+          ctx.globalAlpha=0.3; ctx.fillStyle=result.fill_color;
+          ctx.fillRect(rx,ry,rw,rh); ctx.globalAlpha=1;
+        }
+        const pad=4;
+        ctx.filter='blur(2px)';
+        ctx.drawImage(canvas,Math.max(0,rx-pad),Math.max(0,ry-pad),rw+pad*2,rh+pad*2,
+                              Math.max(0,rx-pad),Math.max(0,ry-pad),rw+pad*2,rh+pad*2);
+        ctx.filter='none';
+      });
+    }
+
+    // ─── Local watermark removal ──────────────────────────────────────────────
+    function localRemove(canvas, mode) {
+      const ctx = canvas.getContext('2d');
+      const W=canvas.width, H=canvas.height;
+      const zones=[
+        {x:0,y:Math.floor(H*0.83),w:W,h:Math.floor(H*0.17)},
+        {x:Math.floor(W*0.2),y:Math.floor(H*0.38),w:Math.floor(W*0.6),h:Math.floor(H*0.24)},
+      ];
+      zones.forEach(z=>{
+        try {
+          const d=ctx.getImageData(z.x,z.y,z.w,z.h).data;
+          let bright=0;
+          for(let i=0;i<d.length;i+=4) if((d[i]+d[i+1]+d[i+2])/3>210) bright++;
+          if(bright/(d.length/4)>0.3){
+            if(mode==='blur'){
+              for(let i=0;i<12;i++){ctx.filter='blur(5px)';ctx.drawImage(canvas,z.x,z.y,z.w,z.h,z.x,z.y,z.w,z.h);}
+              ctx.filter='none';
+            } else {
+              const px=ctx.getImageData(Math.max(0,z.x-2),z.y+Math.floor(z.h/2),1,1).data;
+              ctx.fillStyle=`rgb(${px[0]},${px[1]},${px[2]})`;
+              ctx.fillRect(z.x,z.y,z.w,z.h);
+            }
+          }
+        } catch(e){}
+      });
+    }
+
+    // ─── Components ───────────────────────────────────────────────────────────
+    function Toggle({checked, onChange}) {
+      return (
+        <div onClick={()=>onChange(!checked)} style={{
+          width:44,height:24,borderRadius:12,flexShrink:0,cursor:'pointer',
+          background:checked?'#4fffb0':'#2a2f40',position:'relative',transition:'background .2s'
+        }}>
+          <div style={{
+            position:'absolute',top:3,left:checked?23:3,
+            width:18,height:18,borderRadius:'50%',
+            background:checked?'#0d0f14':'#fff',
+            transition:'left .2s',boxShadow:'0 1px 4px rgba(0,0,0,.4)'
+          }}/>
+        </div>
+      );
+    }
+
+    function StatusDot({status}) {
+      const colors={waiting:'#6b7394',processing:'#3dd4ff',done:'#4fffb0',error:'#ff5e7a'};
+      return (
+        <span style={{
+          display:'inline-block',width:6,height:6,borderRadius:'50%',
+          background:colors[status]||'#6b7394',marginRight:5,flexShrink:0,
+          animation:status==='processing'?'pulse 1s infinite':undefined
+        }}/>
+      );
+    }
+
+    // ─── Main App ─────────────────────────────────────────────────────────────
+    function FotoLimpa() {
+      const [items, setItems] = useState([]);
+      const [optMeta, setOptMeta] = useState(true);
+      const [optWm, setOptWm] = useState(false);
+      const [wmMode, setWmMode] = useState('ai');
+      const [quality, setQuality] = useState(92);
+      const [totalMeta, setTotalMeta] = useState(0);
+      const processingRef = useRef(false);
+
+      const addFiles = useCallback((fileList) => {
+        const newItems = Array.from(fileList)
+          .filter(f=>f.type.startsWith('image/'))
+          .map(f=>({
+            id:`f${Date.now()}${Math.random().toString(36).slice(2,5)}`,
+            file:f, status:'waiting', blob:null,
+            logs:[], tags:[], beforeUrl:URL.createObjectURL(f), afterUrl:null
+          }));
+        setItems(prev=>[...prev,...newItems]);
+      },[]);
+
+      const updateItem = (id, patch) =>
+        setItems(prev=>prev.map(it=>it.id===id?{...it,...patch}:it));
+
+      const pushLog = (id, text, state='') =>
+        setItems(prev=>prev.map(it=>it.id===id
+          ?{...it,logs:[...it.logs,{text,state,key:Math.random()}]}
+          :it));
+
+      const removeItem = (id) => setItems(prev=>prev.filter(it=>it.id!==id));
+
+      async function processFile(item) {
+        const {id, file} = item;
+        updateItem(id,{status:'processing',logs:[],tags:[],afterUrl:null});
+
+        try {
+          pushLog(id,'Carregando imagem…','active');
+          const img = await loadImg(file);
+          const canvas = document.createElement('canvas');
+          canvas.width=img.naturalWidth; canvas.height=img.naturalHeight;
+          canvas.getContext('2d').drawImage(img,0,0);
+          pushLog(id,'Imagem carregada','done');
+
+          pushLog(id,'Analisando metadados…','active');
+          const tags = optMeta ? await extractExifTags(file) : [];
+          setTotalMeta(p=>p+tags.length);
+          updateItem(id,{tags});
+          pushLog(id,tags.length?`${tags.length} tag(s) EXIF removidas`:'Sem metadados detectados','done');
+
+          if (optWm) {
+            pushLog(id,wmMode==='ai'?"Enviando para IA…":"Detectando marca d'água…",'active');
+            if (wmMode==='ai') {
+              await aiWatermarkRemove(canvas, (text,state)=>{
+                setItems(prev=>prev.map(it=>it.id===id
+                  ?{...it,logs:[...it.logs,{text,state,key:Math.random()}]}
+                  :it));
+              });
+            } else {
+              localRemove(canvas, wmMode);
+              pushLog(id,'Remoção local aplicada','done');
+            }
+          }
+
+          pushLog(id,'Exportando…','active');
+          const blob = await toBlob(canvas,'image/jpeg',quality/100);
+          const afterUrl = URL.createObjectURL(blob);
+          updateItem(id,{status:'done',blob,afterUrl,tags});
+          pushLog(id,`Pronta! Qualidade ${quality}%`,'done');
+
+        } catch(err) {
+          updateItem(id,{status:'error'});
+          setItems(prev=>prev.map(it=>it.id===id
+            ?{...it,logs:[...it.logs,{text:'⚠ '+(err.message||'Erro'),state:'',key:Math.random()}]}
+            :it));
+        }
+      }
+
+      async function processAll() {
+        if(processingRef.current) return;
+        processingRef.current=true;
+        const pending = items.filter(it=>it.status==='waiting'||it.status==='error');
+        for(const it of pending) await processFile(it);
+        processingRef.current=false;
+      }
+
+      function downloadAll() {
+        items.filter(it=>it.blob).forEach((it,i)=>{
+          setTimeout(()=>dlBlob(it.blob,it.file.name.replace(/\.[^/.]+$/,'')+'_limpa.jpg'),i*400);
+        });
+      }
+
+      const done = items.filter(it=>it.status==='done').length;
+
+      const modeOptions=[
+        {id:'ai',icon:'🤖',name:'IA — Reconstrução',desc:'Claude detecta e reconstrói o fundo',tag:'Melhor',tagColor:'#3dd4ff'},
+        {id:'blur',icon:'🌫️',name:'Desfoque',desc:'Borra a região detectada',tag:'Rápido',tagColor:'#4fffb0'},
+        {id:'fill',icon:'🎨',name:'Preenchimento',desc:'Cobre com cor ao redor',tag:'Rápido',tagColor:'#4fffb0'},
+      ];
+
+      return (
+        <div style={{background:'#0d0f14',minHeight:'100vh',color:'#e8eaf2',fontFamily:'system-ui,sans-serif'}}>
+
+          {/* HEADER */}
+          <div style={{
+            position:'sticky',top:0,zIndex:100,
+            background:'rgba(13,15,20,.95)',backdropFilter:'blur(20px)',
+            borderBottom:'1px solid #2a2f40',padding:'13px 18px',
+            display:'flex',alignItems:'center',justifyContent:'space-between'
+          }}>
+            <div style={{display:'flex',alignItems:'center',gap:8,fontFamily:'monospace',fontWeight:700,fontSize:17}}>
+              <div style={{width:8,height:8,borderRadius:'50%',background:'#4fffb0',boxShadow:'0 0 10px #4fffb0'}}/>
+              FotoLimpa
+            </div>
+            <span style={{fontSize:10,fontWeight:700,letterSpacing:1,background:'rgba(79,255,176,.12)',color:'#4fffb0',border:'1px solid rgba(79,255,176,.3)',padding:'3px 8px',borderRadius:20,textTransform:'uppercase'}}>IA + LOCAL</span>
+          </div>
+
+          <div style={{padding:'18px 18px 120px',maxWidth:540,margin:'0 auto'}}>
+
+            {/* HERO */}
+            <div style={{textAlign:'center',padding:'20px 0 16px'}}>
+              <h1 style={{fontSize:26,fontWeight:700,lineHeight:1.2,letterSpacing:-.5,margin:0}}>
+                Fotos limpas,<br/><span style={{color:'#4fffb0'}}>sem rastro</span>
+              </h1>
+              <p style={{marginTop:8,color:'#6b7394',fontSize:14,lineHeight:1.5}}>
+                Remove EXIF e marca d'água com IA
+              </p>
+            </div>
+
+            {/* UPLOAD */}
+            <label style={{
+              display:'block',border:'2px dashed #2a2f40',borderRadius:16,
+              padding:'28px 20px',textAlign:'center',cursor:'pointer',
+              background:'#161921',position:'relative',overflow:'hidden'
+            }}>
+              <input
+                type="file" multiple accept="image/*"
+                style={{position:'absolute',inset:0,opacity:0,cursor:'pointer',fontSize:0,zIndex:2}}
+                onChange={e=>{addFiles(e.target.files);e.target.value='';}}
+              />
+              <div style={{fontSize:36,marginBottom:10}}>📷</div>
+              <div style={{fontWeight:600,fontSize:15}}>Toque para escolher fotos</div>
+              <div style={{fontSize:13,color:'#6b7394',marginTop:4}}>JPG, PNG, WEBP — várias de uma vez</div>
+              <div style={{
+                display:'inline-block',marginTop:14,
+                background:'#4fffb0',color:'#0d0f14',fontWeight:700,fontSize:14,
+                padding:'10px 22px',borderRadius:12,pointerEvents:'none'
+              }}>Abrir galeria</div>
+            </label>
+
+            {/* STATS */}
+            {items.length>0 && (
+              <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginTop:12}}>
+                {[['Fotos',items.length],['Prontas',done],['Tags limpas',totalMeta]].map(([l,v])=>(
+                  <div key={l} style={{background:'#161921',border:'1px solid #2a2f40',borderRadius:10,padding:12,textAlign:'center'}}>
+                    <div style={{fontFamily:'monospace',fontSize:22,fontWeight:700,color:'#4fffb0'}}>{v}</div>
+                    <div style={{fontSize:11,color:'#6b7394',marginTop:2}}>{l}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* OPTIONS */}
+            {items.length>0 && (
+              <div style={{background:'#161921',border:'1px solid #2a2f40',borderRadius:16,padding:18,marginTop:12}}>
+                <div style={{fontSize:10,fontWeight:700,letterSpacing:1.5,textTransform:'uppercase',color:'#6b7394',marginBottom:12}}>O que limpar</div>
+
+                <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 0',borderBottom:'1px solid #2a2f40'}}>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:500}}>Metadados EXIF / IPTC</div>
+                    <div style={{fontSize:12,color:'#6b7394',marginTop:2}}>GPS, câmera, data, dispositivo</div>
+                  </div>
+                  <Toggle checked={optMeta} onChange={setOptMeta}/>
+                </div>
+
+                <div style={{padding:'10px 0'}}>
+                  <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                    <div>
+                      <div style={{fontSize:14,fontWeight:500}}>Remover marca d'água</div>
+                      <div style={{fontSize:12,color:'#6b7394',marginTop:2}}>IA detecta e reconstrói a região</div>
+                    </div>
+                    <Toggle checked={optWm} onChange={setOptWm}/>
+                  </div>
+
+                  {optWm && (
+                    <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:6}}>
+                      {modeOptions.map(m=>(
+                        <div key={m.id} onClick={()=>setWmMode(m.id)} style={{
+                          display:'flex',alignItems:'center',gap:10,
+                          background:wmMode===m.id?'rgba(79,255,176,.07)':'#1e2230',
+                          border:`1.5px solid ${wmMode===m.id?'#4fffb0':'#2a2f40'}`,
+                          borderRadius:10,padding:'10px 12px',cursor:'pointer',
+                        }}>
+                          <div style={{
+                            width:34,height:34,borderRadius:8,flexShrink:0,
+                            background:wmMode===m.id?'rgba(79,255,176,.15)':'#2a2f40',
+                            display:'flex',alignItems:'center',justifyContent:'center',fontSize:16
+                          }}>{m.icon}</div>
+                          <div style={{flex:1}}>
+                            <div style={{fontSize:13,fontWeight:600}}>
+                              {m.name}{' '}
+                              <span style={{fontSize:9,fontWeight:700,background:`${m.tagColor}20`,color:m.tagColor,padding:'1px 5px',borderRadius:4,textTransform:'uppercase'}}>{m.tag}</span>
+                            </div>
+                            <div style={{fontSize:11,color:'#6b7394',marginTop:1}}>{m.desc}</div>
+                          </div>
+                        </div>
+                      ))}
+                      {wmMode==='ai' && (
+                        <div style={{background:'rgba(61,212,255,.07)',border:'1px solid rgba(61,212,255,.2)',borderRadius:10,padding:'9px 12px',fontSize:12,color:'#3dd4ff'}}>
+                          ℹ️ Claude analisa cada foto via API. Requer conexão com internet.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{marginTop:12}}>
+                  <div style={{display:'flex',justifyContent:'space-between',fontSize:13,marginBottom:8}}>
+                    <span>Qualidade de exportação</span>
+                    <span style={{fontFamily:'monospace',color:'#4fffb0'}}>{quality}%</span>
+                  </div>
+                  <input type="range" min={60} max={100} value={quality} onChange={e=>setQuality(+e.target.value)}/>
+                </div>
+              </div>
+            )}
+
+            {/* CARDS */}
+            <div style={{marginTop:14,display:'flex',flexDirection:'column',gap:10}}>
+              {items.map(it=>(
+                <div key={it.id} style={{
+                  background:'#161921',
+                  border:`1px solid ${it.status==='done'?'#4fffb0':it.status==='error'?'#ff5e7a':it.status==='processing'?'#3dd4ff':'#2a2f40'}`,
+                  borderRadius:16,overflow:'hidden',animation:'fadeIn .2s ease'
+                }}>
+                  <div style={{height:3,background:'#2a2f40'}}>
+                    <div style={{
+                      height:'100%',
+                      width:it.status==='done'?'100%':it.status==='processing'?'65%':'0%',
+                      background:'linear-gradient(90deg,#3dd4ff,#4fffb0)',transition:'width .4s ease'
+                    }}/>
+                  </div>
+
+                  <div style={{display:'flex',alignItems:'center',gap:12,padding:12}}>
+                    <img src={it.beforeUrl} alt="" style={{width:52,height:52,borderRadius:10,objectFit:'cover',flexShrink:0}}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{it.file.name}</div>
+                      <div style={{fontSize:11,color:'#6b7394',marginTop:2}}>
+                        {it.file.size<1048576?(it.file.size/1024).toFixed(0)+' KB':((it.file.size/1048576)).toFixed(1)+' MB'} · {it.file.type.split('/')[1].toUpperCase()}
+                      </div>
+                      <div style={{display:'flex',alignItems:'center',marginTop:4,fontSize:11,fontWeight:500,
+                        color:it.status==='done'?'#4fffb0':it.status==='error'?'#ff5e7a':it.status==='processing'?'#3dd4ff':'#6b7394'}}>
+                        <StatusDot status={it.status}/>
+                        {{waiting:'Aguardando',processing:'Processando…',done:'Pronta!',error:'Erro'}[it.status]}
+                      </div>
+                    </div>
+                    <button onClick={()=>removeItem(it.id)} style={{background:'none',border:'none',color:'#6b7394',cursor:'pointer',fontSize:20,padding:4,lineHeight:1}}>×</button>
+                  </div>
+
+                  {it.logs.length>0 && (
+                    <div style={{margin:'0 12px 10px',padding:'10px 12px',background:'#1e2230',borderRadius:10}}>
+                      {it.logs.map(l=>(
+                        <div key={l.key} style={{display:'flex',gap:7,padding:'2px 0',fontSize:12,
+                          color:l.state==='done'?'#e8eaf2':l.state==='active'?'#3dd4ff':'#6b7394'}}>
+                          <span>{{done:'✓',active:'◌','':'·'}[l.state]||'·'}</span><span>{l.text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {it.tags.length>0 && (
+                    <div style={{display:'flex',flexWrap:'wrap',gap:5,margin:'0 12px 10px'}}>
+                      {it.tags.map(t=>(
+                        <span key={t} style={{background:'rgba(255,94,122,.1)',color:'#ff5e7a',border:'1px solid rgba(255,94,122,.2)',padding:'2px 8px',borderRadius:6,fontFamily:'monospace',fontSize:10}}>✕ {t}</span>
+                      ))}
+                    </div>
+                  )}
+                  {it.status!=='waiting'&&it.tags.length===0&&(
+                    <div style={{margin:'0 12px 10px'}}>
+                      <span style={{background:'rgba(79,255,176,.08)',color:'#4fffb0',border:'1px solid rgba(79,255,176,.2)',padding:'2px 8px',borderRadius:6,fontFamily:'monospace',fontSize:10}}>✓ Sem EXIF</span>
+                    </div>
+                  )}
+
+                  {it.afterUrl && (
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,margin:'0 12px 10px'}}>
+                      {[['Antes',it.beforeUrl],['Depois ✨',it.afterUrl]].map(([label,src])=>(
+                        <div key={label} style={{textAlign:'center'}}>
+                          <div style={{fontSize:10,fontWeight:700,letterSpacing:.8,textTransform:'uppercase',color:'#6b7394',marginBottom:4}}>{label}</div>
+                          <img src={src} alt={label} style={{width:'100%',borderRadius:8,aspectRatio:'1',objectFit:'cover'}}/>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{display:'flex',gap:8,padding:'0 12px 12px'}}>
+                    <button onClick={()=>processFile(it)} disabled={it.status==='processing'} style={{
+                      flex:1,padding:9,borderRadius:8,fontSize:13,fontWeight:600,cursor:'pointer',
+                      border:'1px solid #2a2f40',background:'#1e2230',color:'#e8eaf2',
+                      opacity:it.status==='processing'?.5:1,fontFamily:'inherit'
+                    }}>▶ Limpar</button>
+                    <button onClick={()=>dlBlob(it.blob,it.file.name.replace(/\.[^/.]+$/,'')+'_limpa.jpg')}
+                      disabled={!it.blob} style={{
+                      flex:1,padding:9,borderRadius:8,fontSize:13,fontWeight:600,cursor:'pointer',
+                      border:'none',background:'#4fffb0',color:'#0d0f14',
+                      opacity:it.blob?1:.3,fontFamily:'inherit'
+                    }}>⬇ Salvar</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* BOTTOM BAR */}
+          {items.length>0 && (
+            <div style={{position:'fixed',bottom:0,left:0,right:0,background:'rgba(13,15,20,.95)',backdropFilter:'blur(20px)',borderTop:'1px solid #2a2f40',padding:'12px 18px',zIndex:100}}>
+              <div style={{maxWidth:540,margin:'0 auto',display:'flex',gap:10}}>
+                <button onClick={processAll} style={{
+                  flex:1,background:'#4fffb0',color:'#0d0f14',fontFamily:'inherit',fontWeight:700,fontSize:15,
+                  padding:14,borderRadius:12,border:'none',cursor:'pointer',
+                  display:'flex',alignItems:'center',justifyContent:'center',gap:8
+                }}>⚡ Limpar todas</button>
+                {done>0&&(
+                  <button onClick={downloadAll} style={{
+                    background:'#1e2230',color:'#e8eaf2',border:'1px solid #2a2f40',
+                    fontFamily:'inherit',fontWeight:600,fontSize:13,padding:'14px 14px',
+                    borderRadius:12,cursor:'pointer',whiteSpace:'nowrap'
+                  }}>⬇ Salvar tudo</button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─── Mount ────────────────────────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<FotoLimpa/>);
+  </script>
+</body>
+</html>
